@@ -267,6 +267,53 @@ QUICK_PROMPTS = {
 }
 
 
+def _agent_turn(client: anthropic.Anthropic, messages: list) -> None:
+    """
+    Run one full agent turn on `messages` (in-place).
+    Handles the tool-use loop until stop_reason == 'end_turn'.
+    Streams text to stdout as it arrives.
+    """
+    while True:
+        printed_any_text = False
+        with client.messages.stream(
+            model="claude-opus-4-6",
+            max_tokens=8192,
+            thinking={"type": "adaptive"},
+            system=SYSTEM_PROMPT,
+            tools=TOOLS,
+            messages=messages,
+        ) as stream:
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+                printed_any_text = True
+            response = stream.get_final_message()
+
+        if printed_any_text:
+            print()  # newline after streamed text
+
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason in ("end_turn", None):
+            break
+
+        if response.stop_reason != "tool_use":
+            break
+
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            print(f"\n[→ {block.name}]", flush=True)
+            result = execute_tool(block.name, block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result,
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
+
 def run_agent(prompt: str) -> None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -279,42 +326,47 @@ def run_agent(prompt: str) -> None:
     print("  SPX INCLUSION MOMENTUM AGENT")
     print(f"{'═'*64}\n")
 
+    _agent_turn(client, messages)
+
+
+def run_chat() -> None:
+    """
+    Interactive chat mode.
+    Conversation history is preserved across turns so Claude remembers
+    previous questions and tool results within the same session.
+    Type 'exit' or 'quit' or press Ctrl-C/Ctrl-D to end.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        sys.exit("ERROR: ANTHROPIC_API_KEY is not set.")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    messages: list = []
+
+    print(f"\n{'═'*64}")
+    print("  SPX INCLUSION MOMENTUM — INTERACTIVE CHAT")
+    print(f"{'═'*64}")
+    print("  Ask anything about the strategy. Type 'exit' to quit.")
+    print(f"{'─'*64}\n")
+
     while True:
-        with client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=8192,
-            thinking={"type": "adaptive"},
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        ) as stream:
-            response = stream.get_final_message()
-
-        for block in response.content:
-            if block.type == "text" and block.text.strip():
-                print(block.text)
-
-        messages.append({"role": "assistant", "content": response.content})
-
-        if response.stop_reason == "end_turn":
+        try:
+            user_input = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
             break
 
-        if response.stop_reason != "tool_use":
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit", "q"):
+            print("Bye.")
             break
 
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            print(f"\n[→ {block.name}]")
-            result = execute_tool(block.name, block.input)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": result,
-            })
+        messages.append({"role": "user", "content": user_input})
 
-        messages.append({"role": "user", "content": tool_results})
+        print("\nClaude: ", end="", flush=True)
+        _agent_turn(client, messages)
+        print()
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -328,10 +380,18 @@ def main():
         help="Preset command (default: full)",
     )
     parser.add_argument("--prompt", help="Custom prompt (overrides --cmd)")
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Start interactive chat session (preserves conversation history)",
+    )
     args = parser.parse_args()
 
-    prompt = args.prompt if args.prompt else QUICK_PROMPTS[args.cmd]
-    run_agent(prompt)
+    if args.chat:
+        run_chat()
+    else:
+        prompt = args.prompt if args.prompt else QUICK_PROMPTS[args.cmd]
+        run_agent(prompt)
 
 
 if __name__ == "__main__":
