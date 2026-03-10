@@ -1,0 +1,6 @@
+ticker,company,date,effective_date,event_type
+NVDA,NVIDIA Corporation,2020-11-30,2020-12-01,additions
+TGT,Target Corporation,2020-11-30,2020-12-01,additions
+ETSY,Etsy Inc,2020-11-30,2020-12-01,additions
+TSLA,Tesla Inc,2020-12-21,2020-12-21,additions
+MRNA,Moderna Inc,2021-07-21,2021-07-21,additions

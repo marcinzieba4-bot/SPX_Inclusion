@@ -1,0 +1,6 @@
+anthropic>=0.40.0
+yfinance>=0.2.40
+pandas>=2.0.0
+lxml>=5.0.0        # for pd.read_html (Wikipedia scrape)
+html5lib>=1.1      # fallback HTML parser for pd.read_html
+python-dotenv>=1.0.0
