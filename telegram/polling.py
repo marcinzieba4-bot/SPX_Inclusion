@@ -36,12 +36,35 @@ import urllib.request
 
 import anthropic
 import boto3
+from pathlib import Path
 
 # ── Path: allow imports from project root ─────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.join(_HERE, "..")
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
+
+
+def _load_env_file() -> None:
+    """Load .env from project root if present, without overwriting existing vars."""
+    env_path = Path(_ROOT) / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+    if "ALLOWED_CHAT_ID" not in os.environ and "TELEGRAM_CHAT_ID" in os.environ:
+        os.environ["ALLOWED_CHAT_ID"] = os.environ["TELEGRAM_CHAT_ID"]
+    if "AWS_DEFAULT_REGION" not in os.environ and "AWS_REGION" in os.environ:
+        os.environ["AWS_DEFAULT_REGION"] = os.environ["AWS_REGION"]
+
+_load_env_file()  # must run before importing handler (which reads env at import time)
 
 from telegram.handler import (   # noqa: E402
     BOT_TOKEN,

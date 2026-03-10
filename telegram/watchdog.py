@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -44,7 +45,30 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 _HERE         = os.path.dirname(os.path.abspath(__file__))
+_ROOT         = os.path.join(_HERE, "..")
 _POLLING      = os.path.join(_HERE, "polling.py")
+_ENV_FILE     = os.path.join(_ROOT, ".env")
+
+
+def _load_env_file() -> None:
+    """Load .env from project root if it exists, without overwriting existing vars."""
+    env_path = Path(_ENV_FILE)
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip().strip('"').strip("'")
+        if key and key not in os.environ:   # don't overwrite already-set vars
+            os.environ[key] = val
+    # ALLOWED_CHAT_ID alias
+    if "ALLOWED_CHAT_ID" not in os.environ and "TELEGRAM_CHAT_ID" in os.environ:
+        os.environ["ALLOWED_CHAT_ID"] = os.environ["TELEGRAM_CHAT_ID"]
+    if "AWS_DEFAULT_REGION" not in os.environ and "AWS_REGION" in os.environ:
+        os.environ["AWS_DEFAULT_REGION"] = os.environ["AWS_REGION"]
 
 INITIAL_DELAY    = 2.0    # seconds before first restart
 MAX_DELAY        = 60.0   # cap for exponential backoff
@@ -91,6 +115,7 @@ def _heartbeat_loop() -> None:
 def run() -> None:
     global _child_ref
 
+    _load_env_file()
     log.info("Watchdog started. Managing: %s", _POLLING)
     log.info("Heartbeat file: %s (interval %ds)", HEARTBEAT_FILE, HEARTBEAT_INTERVAL)
 
