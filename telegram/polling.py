@@ -70,6 +70,7 @@ from telegram.handler import (   # noqa: E402
     BOT_TOKEN,
     ALLOWED_CHAT_ID,
     _TG_API,
+    _post,
     cmd_help,
     cmd_run,
     cmd_latest,
@@ -172,44 +173,81 @@ def get_updates(offset: int) -> list:
 # Per-chat conversation history (in-memory; reset on process restart)
 _histories: dict[int, list] = {}
 
+_EDIT_INTERVAL = 1.2   # minimum seconds between editMessageText calls
+
+
+def _send_and_get_id(chat_id: int, text: str) -> int | None:
+    """Send a message and return its message_id (for later editing)."""
+    try:
+        resp = _post("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        return resp.get("result", {}).get("message_id")
+    except Exception:
+        return None
+
+
+def _edit(chat_id: int, message_id: int, text: str) -> None:
+    """Edit an existing message. Silently ignores 'not modified' errors."""
+    if not message_id:
+        return
+    try:
+        _post("editMessageText", {
+            "chat_id":    chat_id,
+            "message_id": message_id,
+            "text":       text[:4096],
+        })
+    except Exception as exc:
+        if "message is not modified" not in str(exc):
+            log.debug("editMessageText failed: %s", exc)
+
 
 def _claude_reply(chat_id: int, user_text: str) -> None:
     """
-    Route a free-form message to Claude, run the full tool-use loop,
-    and send the result back to Telegram in ≤4000-char chunks.
+    Stream Claude's response live into Telegram by editing the placeholder
+    message as text tokens arrive — mirrors agent._agent_turn() but sends
+    to Telegram instead of stdout.
 
-    Conversation history is preserved per chat_id so follow-up questions
-    work naturally (e.g. "What about sector attribution?" after asking
-    about CAGR doesn't need context repeated).
+    Uses stream.text_stream so the user sees text immediately instead of
+    waiting for the full response (which can include long thinking phases).
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         send(chat_id, "⚠️ ANTHROPIC_API_KEY not set on the server.")
         return
 
-    client   = anthropic.Anthropic(api_key=api_key)
-    history  = _histories.setdefault(chat_id, [])
+    client  = anthropic.Anthropic(api_key=api_key)
+    history = _histories.setdefault(chat_id, [])
     history.append({"role": "user", "content": user_text})
 
-    messages = list(history)   # working copy for this turn
+    messages    = list(history)
     reply_parts: list[str] = []
 
-    # Tool-use loop — mirrors agent._agent_turn() but collects text
-    # instead of printing, so we can send it to Telegram
+    # Send the placeholder and grab its message_id so we can edit it live
+    msg_id = _send_and_get_id(chat_id, "_(thinking…)_")
+
     while True:
+        accumulated = ""
+        last_edit   = 0.0   # force first edit as soon as text arrives
+
         with client.messages.stream(
             model="claude-opus-4-6",
-            max_tokens=4096,
+            max_tokens=8192,
             thinking={"type": "adaptive"},
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
         ) as stream:
+            for token in stream.text_stream:
+                accumulated += token
+                now = time.monotonic()
+                if now - last_edit >= _EDIT_INTERVAL:
+                    prefix = "\n\n".join(reply_parts)
+                    live   = (prefix + "\n\n" + accumulated).strip() + " ▌"
+                    _edit(chat_id, msg_id, live)
+                    last_edit = now
             response = stream.get_final_message()
 
-        for block in response.content:
-            if block.type == "text" and block.text.strip():
-                reply_parts.append(block.text.strip())
+        if accumulated.strip():
+            reply_parts.append(accumulated.strip())
 
         messages.append({"role": "assistant", "content": response.content})
 
@@ -223,6 +261,10 @@ def _claude_reply(chat_id: int, user_text: str) -> None:
             if block.type != "tool_use":
                 continue
             log.info("Tool call: %s (chat %d)", block.name, chat_id)
+            # Show which tool is running
+            status = "\n\n".join(reply_parts)
+            status = (status + f"\n\n_(running {block.name}…)_").strip()
+            _edit(chat_id, msg_id, status)
             result = execute_tool(block.name, block.input)
             tool_results.append({
                 "type":        "tool_result",
@@ -231,14 +273,18 @@ def _claude_reply(chat_id: int, user_text: str) -> None:
             })
         messages.append({"role": "user", "content": tool_results})
 
-    # Persist the completed turn into the conversation history
+    # Persist the completed conversation turn
     _histories[chat_id] = messages
 
     full_reply = "\n\n".join(reply_parts) or "_(no response)_"
 
-    # Split into 4000-char Telegram-safe chunks
-    for i in range(0, len(full_reply), 4000):
-        send(chat_id, full_reply[i : i + 4000])
+    if len(full_reply) <= 4000:
+        _edit(chat_id, msg_id, full_reply)
+    else:
+        # First chunk replaces the placeholder; subsequent chunks are new messages
+        _edit(chat_id, msg_id, full_reply[:4000])
+        for i in range(4000, len(full_reply), 4000):
+            send(chat_id, full_reply[i : i + 4000])
 
 
 # ── Command dispatch ──────────────────────────────────────────────────────────
