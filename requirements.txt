@@ -1,6 +1,5 @@
 anthropic>=0.40.0
-yfinance>=0.2.40
-pandas>=2.0.0
-lxml>=5.0.0        # for pd.read_html (Wikipedia scrape)
-html5lib>=1.1      # fallback HTML parser for pd.read_html
 python-dotenv>=1.0.0
+# spx_inclusion_momentum.py uses only stdlib (math, random, statistics, dataclasses, datetime)
+# telegram/handler.py uses only stdlib (json, urllib, os, sys, datetime)
+# No external data dependencies — dataset is embedded in spx_inclusion_momentum.py

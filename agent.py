@@ -2,258 +2,284 @@
 """
 SPX Inclusion + Momentum Backtest Agent
 ========================================
-A Claude-powered agent that backtests the strategy of buying stocks
-announced for S&P 500 inclusion when they also have positive momentum.
+A Claude-powered agent (claude-opus-4-6) that runs and explains the SPX
+Inclusion Momentum strategy using the full backtest engine.
 
 Usage
 -----
-    python agent.py                          # interactive mode
-    python agent.py --start 2021-01-01 --end 2024-01-01
-    python agent.py --lookback 20 --threshold 0.02 --hold 5
+    python agent.py                 # full backtest + analysis
+    python agent.py --cmd run       # backtest summary only
+    python agent.py --cmd next      # next cycle window
+    python agent.py --cmd latest    # most recent addition
+    python agent.py --cmd sector    # sector attribution
 
 Environment
 -----------
-    ANTHROPIC_API_KEY   Required — your Anthropic API key
+    ANTHROPIC_API_KEY   Required
 """
 
 import argparse
-import datetime
 import json
 import os
 import sys
 
 import anthropic
 
-from tools.spx_data import get_spx_changes
-from tools.market_data import get_price_data, get_ticker_info
-from tools.momentum import calculate_momentum, score_candidates
-from tools.backtest import run_backtest, generate_report
+from spx_inclusion_momentum import (
+    BacktestConfig,
+    _parse_additions,
+    _build_candidate_universe,
+    compute_cycle_performance,
+    compute_cumulative_returns,
+    compute_annual_returns,
+    compute_max_drawdown,
+    compute_sharpe,
+    compute_sector_attribution,
+    inclusion_vs_momentum_split,
+    run_backtest,
+)
+from telegram.handler import (
+    cmd_run,
+    cmd_latest,
+    cmd_next,
+    cmd_additions,
+    _next_cycle,
+    _run_full,
+)
+from datetime import date
 
 
-# ─── Tool definitions (sent to Claude) ───────────────────────────────────────
+# ─── Tool implementations ─────────────────────────────────────────────────────
 
-TOOLS: list[dict] = [
+def tool_run_backtest(config_overrides: dict | None = None) -> dict:
+    """Full backtest with optional config overrides."""
+    cfg = BacktestConfig(**(config_overrides or {}))
+    additions = _parse_additions()
+    candidates = _build_candidate_universe(additions)
+    trades = run_backtest(candidates, cfg)
+    cycles = compute_cycle_performance(trades)
+    _, strat_cum, bench_cum = compute_cumulative_returns(cycles)
+    annual = compute_annual_returns(cycles)
+    all_rets = [t.gross_return for t in trades]
+    n_years = len(annual)
+
+    return {
+        "strat_cagr": round((strat_cum[-1] ** (1 / n_years) - 1), 4),
+        "bench_cagr": round((bench_cum[-1] ** (1 / n_years) - 1), 4),
+        "strat_total_return": round(strat_cum[-1] - 1, 4),
+        "bench_total_return": round(bench_cum[-1] - 1, 4),
+        "strat_sharpe": round(compute_sharpe([c.strategy_quarterly for c in cycles]), 3),
+        "bench_sharpe": round(compute_sharpe([c.benchmark_quarterly for c in cycles]), 3),
+        "strat_max_drawdown": round(compute_max_drawdown(strat_cum), 4),
+        "bench_max_drawdown": round(compute_max_drawdown(bench_cum), 4),
+        "n_trades": len(all_rets),
+        "n_cycles": len(cycles),
+        "win_rate": round(sum(1 for r in all_rets if r > 0) / len(all_rets), 4),
+        "annual": {str(y): {k: round(v, 4) if isinstance(v, float) else v
+                             for k, v in d.items()}
+                   for y, d in annual.items()},
+        "first_year": min(annual),
+        "last_year": max(annual),
+    }
+
+
+def tool_sector_attribution() -> dict:
+    additions = _parse_additions()
+    candidates = _build_candidate_universe(additions)
+    trades = run_backtest(candidates, BacktestConfig())
+    attr = compute_sector_attribution(trades)
+    return {s: {k: round(v, 4) if isinstance(v, float) else v
+                for k, v in d.items()}
+            for s, d in attr.items()}
+
+
+def tool_inclusion_split() -> dict:
+    additions = _parse_additions()
+    candidates = _build_candidate_universe(additions)
+    trades = run_backtest(candidates, BacktestConfig())
+    split = inclusion_vs_momentum_split(trades)
+    return {k: {kk: round(vv, 4) if isinstance(vv, float) else vv
+                for kk, vv in v.items()}
+            for k, v in split.items()}
+
+
+def tool_next_cycle() -> dict:
+    today = date.today()
+    nxt = _next_cycle(today)
+    return {
+        "label": nxt["label"],
+        "announce_approx": str(nxt["announce_approx"]),
+        "entry_approx": str(nxt["entry_approx"]),
+        "days_to_announce": nxt["days_to_announce"],
+        "entry_window_open": nxt["days_to_announce"] <= 30,
+    }
+
+
+def tool_latest_addition() -> dict:
+    additions = _parse_additions()
+    a = additions[-1]
+    total = a.ret_entry_to_announce + a.ret_announce_to_eff + a.ret_eff_to_exit
+    return {
+        "ticker": a.ticker,
+        "company": a.company,
+        "sector": a.sector,
+        "announce_date": str(a.announce_date),
+        "effective_date": str(a.effective_date),
+        "mcap_at_add_bn": a.mcap_at_add_bn,
+        "mom_12_1": round(a.mom_12_1, 4),
+        "mom_3m": round(a.mom_3m, 4),
+        "ret_entry_to_announce": round(a.ret_entry_to_announce, 4),
+        "ret_announce_to_eff": round(a.ret_announce_to_eff, 4),
+        "ret_eff_to_exit": round(a.ret_eff_to_exit, 4),
+        "total_return": round(total, 4),
+    }
+
+
+def tool_recent_additions(n: int = 5) -> list[dict]:
+    additions = _parse_additions()
+    result = []
+    for a in additions[-n:]:
+        total = a.ret_entry_to_announce + a.ret_announce_to_eff + a.ret_eff_to_exit
+        result.append({
+            "ticker": a.ticker,
+            "company": a.company,
+            "sector": a.sector,
+            "announce_date": str(a.announce_date),
+            "total_return": round(total, 4),
+            "mom_12_1": round(a.mom_12_1, 4),
+        })
+    return result
+
+
+# ─── Claude tool definitions ──────────────────────────────────────────────────
+
+TOOLS = [
     {
-        "name": "get_spx_changes",
+        "name": "run_backtest",
         "description": (
-            "Fetch historical S&P 500 additions or removals. "
-            "Returns a list of events with ticker, company, announcement date, "
-            "and effective date."
+            "Run the full SPX Inclusion Momentum backtest (2012–2026). "
+            "Returns CAGR, Sharpe, max drawdown, win rate, and annual returns "
+            "vs S&P 500 benchmark. Optionally accepts config overrides."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "start_date": {
-                    "type": "string",
-                    "description": "Start of period, YYYY-MM-DD. Defaults to 3 years ago.",
-                },
-                "end_date": {
-                    "type": "string",
-                    "description": "End of period, YYYY-MM-DD. Defaults to today.",
-                },
-                "event_type": {
-                    "type": "string",
-                    "enum": ["additions", "removals", "both"],
-                    "description": "Which type of changes to return.",
-                },
+                "config_overrides": {
+                    "type": "object",
+                    "description": (
+                        "Optional BacktestConfig overrides. Keys: "
+                        "top_quintile_threshold (float, default 0.85), "
+                        "max_positions (int, default 20), "
+                        "position_size_pct (float, default 0.05), "
+                        "stop_loss (float, default -0.15)."
+                    ),
+                }
             },
             "required": [],
         },
     },
     {
-        "name": "get_price_data",
-        "description": (
-            "Download daily closing prices for a list of tickers between two dates. "
-            "Returns {ticker: {date: price}}."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "tickers": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of ticker symbols.",
-                },
-                "start_date": {
-                    "type": "string",
-                    "description": "Start date YYYY-MM-DD.",
-                },
-                "end_date": {
-                    "type": "string",
-                    "description": "End date YYYY-MM-DD.",
-                },
-            },
-            "required": ["tickers", "start_date", "end_date"],
-        },
+        "name": "sector_attribution",
+        "description": "Break down strategy returns by GICS sector (count, mean return, win rate).",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "score_candidates",
+        "name": "inclusion_split",
         "description": (
-            "Score SPX inclusion candidates by price momentum and filter by threshold. "
-            "Returns 'scored' (all) and 'filtered' (passing threshold) lists."
+            "Split performance: stocks actually added to S&P 500 vs pure momentum "
+            "candidates that were never added. Shows whether inclusion premium or "
+            "momentum is the primary driver."
         ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "candidates": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                    "description": "List of event dicts from get_spx_changes.",
-                },
-                "price_data": {
-                    "type": "object",
-                    "description": "Price data from get_price_data.",
-                },
-                "lookback_days": {
-                    "type": "integer",
-                    "description": "Trading days to look back for momentum calculation.",
-                    "default": 20,
-                },
-                "momentum_threshold": {
-                    "type": "number",
-                    "description": "Minimum momentum (fractional) to pass filter. E.g. 0.02 = 2%.",
-                    "default": 0.0,
-                },
-            },
-            "required": ["candidates", "price_data"],
-        },
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "run_backtest",
-        "description": (
-            "Simulate the SPX inclusion + momentum strategy on filtered candidates. "
-            "Returns per-trade results, performance metrics, and equity curve."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "candidates": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                    "description": "Filtered candidates from score_candidates.",
-                },
-                "price_data": {
-                    "type": "object",
-                    "description": "Price data from get_price_data.",
-                },
-                "hold_days": {
-                    "type": "integer",
-                    "description": "Calendar days to hold after effective date.",
-                    "default": 5,
-                },
-                "initial_capital": {
-                    "type": "number",
-                    "description": "Starting capital in USD.",
-                    "default": 100000,
-                },
-                "slippage_bps": {
-                    "type": "number",
-                    "description": "One-way slippage in basis points.",
-                    "default": 5,
-                },
-            },
-            "required": ["candidates", "price_data"],
-        },
+        "name": "next_cycle",
+        "description": "Return info about the next S&P 500 rebalance cycle and whether the entry window is open.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "generate_report",
-        "description": "Format a human-readable backtest summary report.",
+        "name": "latest_addition",
+        "description": "Details of the most recent S&P 500 addition in the dataset.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "recent_additions",
+        "description": "List the N most recent S&P 500 additions with momentum and return data.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "backtest_result": {
-                    "type": "object",
-                    "description": "Output from run_backtest.",
-                },
-                "strategy_params": {
-                    "type": "object",
-                    "description": "Dict of strategy parameters to include in header.",
-                },
+                "n": {"type": "integer", "description": "Number of additions to return (default 5)."}
             },
-            "required": ["backtest_result", "strategy_params"],
+            "required": [],
         },
     },
 ]
 
 
-# ─── Tool dispatcher ──────────────────────────────────────────────────────────
-
 def execute_tool(name: str, inputs: dict) -> str:
-    """Route a tool call to the correct implementation and return JSON string."""
-    if name == "get_spx_changes":
-        result = get_spx_changes(**inputs)
-    elif name == "get_price_data":
-        result = get_price_data(**inputs)
-    elif name == "score_candidates":
-        result = score_candidates(**inputs)
-    elif name == "run_backtest":
-        result = run_backtest(**inputs)
-    elif name == "generate_report":
-        result = generate_report(**inputs)
+    if name == "run_backtest":
+        result = tool_run_backtest(inputs.get("config_overrides"))
+    elif name == "sector_attribution":
+        result = tool_sector_attribution()
+    elif name == "inclusion_split":
+        result = tool_inclusion_split()
+    elif name == "next_cycle":
+        result = tool_next_cycle()
+    elif name == "latest_addition":
+        result = tool_latest_addition()
+    elif name == "recent_additions":
+        result = tool_recent_additions(inputs.get("n", 5))
     else:
         result = {"error": f"Unknown tool: {name}"}
-
     return json.dumps(result, default=str)
 
 
-# ─── Agent loop ───────────────────────────────────────────────────────────────
+# ─── Agent ────────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are a quantitative research agent specialising in index-inclusion strategies.
+SYSTEM_PROMPT = """You are a quantitative research analyst specialising in the
+SPX Inclusion Momentum strategy.
 
-Your job: run a backtest of the **SPX Inclusion + Momentum** strategy:
-1. Fetch S&P 500 addition events for the requested period.
-2. Download price data for each candidate (extend the range 30 days before the
-   announcement date to capture momentum, and enough days after the effective date).
-3. Score candidates by momentum and filter by the provided threshold.
-4. Run the backtest with the provided hold-period.
-5. Generate a concise report summarising performance.
+The strategy buys top-quintile momentum stocks from the S&P 500 eligibility pool
+30 days before each quarterly index rebalance, holds through the effective date
+(capturing forced-buying from index funds), then exits.
 
-Always finish with a clear written analysis of:
-- Whether the strategy added alpha over the period
-- Which sectors / dates performed best
-- Any caveats (small sample size, look-ahead bias risks, etc.)
+You have tools to run the full backtest, analyse sector attribution, split
+performance between included vs non-included candidates, and get cycle timing.
 
-Use the tools in order. Be methodical and do not skip steps."""
+When asked for analysis:
+1. Call the relevant tools to gather data
+2. Interpret the numbers — don't just repeat them
+3. Comment on: alpha vs benchmark, Sharpe improvement, where the edge comes from
+   (inclusion premium vs momentum), decay over time, and current cycle timing
+4. Be concise and precise — this is a quant audience"""
+
+QUICK_PROMPTS = {
+    "run":       "Run the full backtest and give me a concise performance summary vs S&P 500.",
+    "sector":    "Show sector attribution and explain which sectors drive most of the alpha.",
+    "split":     "Analyse the inclusion vs pure-momentum performance split. Where does the edge come from?",
+    "next":      "What is the next S&P 500 cycle? Is the entry window open?",
+    "latest":    "Tell me about the most recent S&P 500 addition — momentum score, returns, sector.",
+    "full":      (
+        "Run the full backtest, sector attribution, inclusion split, and next cycle timing. "
+        "Give me a comprehensive analysis: performance vs benchmark, primary edge drivers, "
+        "sector concentration, premium decay, and current actionable signal."
+    ),
+}
 
 
-def run_agent(
-    start_date: str,
-    end_date: str,
-    lookback_days: int = 20,
-    momentum_threshold: float = 0.0,
-    hold_days: int = 5,
-    initial_capital: float = 100_000.0,
-) -> None:
+def run_agent(prompt: str) -> None:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        sys.exit("ERROR: ANTHROPIC_API_KEY environment variable is not set.")
+        sys.exit("ERROR: ANTHROPIC_API_KEY is not set.")
 
     client = anthropic.Anthropic(api_key=api_key)
+    messages = [{"role": "user", "content": prompt}]
 
-    user_prompt = (
-        f"Please backtest the SPX inclusion + momentum strategy with these parameters:\n"
-        f"- Date range       : {start_date} to {end_date}\n"
-        f"- Momentum lookback: {lookback_days} trading days\n"
-        f"- Momentum filter  : {momentum_threshold:.1%} minimum\n"
-        f"- Hold period      : {hold_days} calendar days after effective date\n"
-        f"- Initial capital  : ${initial_capital:,.0f}\n\n"
-        f"Use the available tools step-by-step and end with a written analysis."
-    )
+    print(f"\n{'═'*64}")
+    print("  SPX INCLUSION MOMENTUM AGENT")
+    print(f"{'═'*64}\n")
 
-    messages: list[dict] = [{"role": "user", "content": user_prompt}]
-
-    print(f"\n{'='*60}")
-    print("  SPX INCLUSION + MOMENTUM AGENT")
-    print(f"{'='*60}")
-    print(f"  Period   : {start_date} → {end_date}")
-    print(f"  Lookback : {lookback_days}d  |  Threshold : {momentum_threshold:.1%}  |  Hold : {hold_days}d")
-    print(f"{'='*60}\n")
-
-    turn = 0
     while True:
-        turn += 1
-        print(f"[Turn {turn}] Calling Claude...")
-
         with client.messages.stream(
             model="claude-opus-4-6",
             max_tokens=8192,
@@ -264,96 +290,48 @@ def run_agent(
         ) as stream:
             response = stream.get_final_message()
 
-        # Print any text Claude produced
         for block in response.content:
             if block.type == "text" and block.text.strip():
-                print(f"\n[Claude] {block.text}\n")
+                print(block.text)
 
-        # Append Claude's response
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
-            print("\n[Agent] Done.")
             break
 
         if response.stop_reason != "tool_use":
-            print(f"[Agent] Unexpected stop reason: {response.stop_reason}. Stopping.")
             break
 
-        # Execute all tool calls
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"[Tool ] {block.name}({_summarise_inputs(block.input)})")
-            result_str = execute_tool(block.name, block.input)
-            result_preview = result_str[:200] + "..." if len(result_str) > 200 else result_str
-            print(f"[Tool ] → {result_preview}\n")
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_str,
-                }
-            )
+            print(f"\n[→ {block.name}]")
+            result = execute_tool(block.name, block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result,
+            })
 
         messages.append({"role": "user", "content": tool_results})
 
 
-def _summarise_inputs(inputs: dict) -> str:
-    """One-line summary of tool inputs for logging."""
-    parts = []
-    for k, v in inputs.items():
-        if isinstance(v, list):
-            parts.append(f"{k}=[{len(v)} items]")
-        elif isinstance(v, dict):
-            parts.append(f"{k}={{...}}")
-        else:
-            parts.append(f"{k}={v!r}")
-    return ", ".join(parts)
-
-
 # ─── CLI ─────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    today = datetime.date.today()
-    default_start = (today - datetime.timedelta(days=3 * 365)).isoformat()
-    default_end = today.isoformat()
-
-    parser = argparse.ArgumentParser(
-        description="SPX Inclusion + Momentum Backtest Agent"
-    )
+def main():
+    parser = argparse.ArgumentParser(description="SPX Inclusion Momentum Agent")
     parser.add_argument(
-        "--start", default=default_start, help=f"Start date YYYY-MM-DD (default {default_start})"
+        "--cmd",
+        choices=list(QUICK_PROMPTS.keys()),
+        default="full",
+        help="Preset command (default: full)",
     )
-    parser.add_argument(
-        "--end", default=default_end, help=f"End date YYYY-MM-DD (default {default_end})"
-    )
-    parser.add_argument(
-        "--lookback", type=int, default=20, help="Momentum lookback in trading days (default 20)"
-    )
-    parser.add_argument(
-        "--threshold", type=float, default=0.0,
-        help="Minimum momentum fraction to trade (default 0.0 = no filter)"
-    )
-    parser.add_argument(
-        "--hold", type=int, default=5,
-        help="Calendar days to hold past effective date (default 5)"
-    )
-    parser.add_argument(
-        "--capital", type=float, default=100_000.0,
-        help="Initial capital in USD (default 100000)"
-    )
+    parser.add_argument("--prompt", help="Custom prompt (overrides --cmd)")
     args = parser.parse_args()
 
-    run_agent(
-        start_date=args.start,
-        end_date=args.end,
-        lookback_days=args.lookback,
-        momentum_threshold=args.threshold,
-        hold_days=args.hold,
-        initial_capital=args.capital,
-    )
+    prompt = args.prompt if args.prompt else QUICK_PROMPTS[args.cmd]
+    run_agent(prompt)
 
 
 if __name__ == "__main__":
