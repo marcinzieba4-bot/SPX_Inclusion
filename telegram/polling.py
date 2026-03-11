@@ -80,7 +80,7 @@ log = logging.getLogger(__name__)
 S3_BUCKET     = "s3bucketmz"
 S3_STATE_KEY  = "telegram-polling-offset.json"  # dedicated key, no Lambda conflict
 POLL_INTERVAL = 2     # seconds between polls (timeout=0 non-blocking style)
-MAX_MSG_AGE   = 180   # skip messages older than this (seconds) — same as Lambda
+MAX_MSG_AGE   = 0     # 0 = disabled; Lambda uses 180s but we're persistent so never skip
 HEARTBEAT_INTERVAL = 60
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -265,17 +265,14 @@ def handle_message(message: dict) -> None:
         log.warning("Ignored message from unauthorised chat_id=%d", chat_id)
         return
 
-    # Skip stale messages (e.g. queued while bot was down) — same as Lambda
     age = int(time.time()) - msg_date
-    if age > MAX_MSG_AGE:
-        log.info("Skipping stale message (age=%ds) from chat %d.", age, chat_id)
-        return
-
     text = (message.get("text") or "").strip()
     if not text:
         return
 
     log.info("Message from chat_id=%d (age=%ds): %.80s", chat_id, age, text)
+    if age > 300:
+        log.warning("Processing old message (age=%ds) — bot was likely down.", age)
 
     if text.startswith("/"):
         cmd = text.split()[0].lstrip("/").lower().split("@")[0]
