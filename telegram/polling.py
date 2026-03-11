@@ -2,19 +2,16 @@
 SPX Inclusion Momentum — Telegram Long-Polling Bot
 ===================================================
 
-Runs continuously: polls Telegram getUpdates, dispatches slash-commands
-to the existing handler functions, and routes free-form questions to
-Claude (claude-opus-4-6) with the full SPX agent tool-set.
-
-Per-chat conversation history is kept in memory so follow-up questions
-work naturally within a session. Update offset is persisted to S3 so
-restarts don't re-process old messages.
+Mirrors the pattern used by daily-digest-telegram-webhook Lambda:
+  • timeout=0 polls (non-blocking, sleep between cycles)
+  • skip messages older than MAX_MSG_AGE seconds
+  • plain client.messages.create() — no streaming, no editMessageText
+  • sequential processing — one message fully handled before next poll
 
 Usage
 -----
-    python telegram/polling.py          # direct
-    python -m telegram.polling          # module
-    python telegram/watchdog.py         # recommended (with watchdog)
+    python telegram/polling.py
+    python telegram/watchdog.py   (recommended — with auto-restart)
 
 Required env vars
 -----------------
@@ -29,7 +26,6 @@ import logging
 import os
 import signal
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -46,7 +42,6 @@ if _ROOT not in sys.path:
 
 
 def _load_env_file() -> None:
-    """Load .env from project root if present, without overwriting existing vars."""
     env_path = Path(_ROOT) / ".env"
     if not env_path.exists():
         return
@@ -64,19 +59,11 @@ def _load_env_file() -> None:
     if "AWS_DEFAULT_REGION" not in os.environ and "AWS_REGION" in os.environ:
         os.environ["AWS_DEFAULT_REGION"] = os.environ["AWS_REGION"]
 
-_load_env_file()  # must run before importing handler (which reads env at import time)
+_load_env_file()  # must run before importing handler (reads env at import time)
 
 from telegram.handler import (   # noqa: E402
-    BOT_TOKEN,
-    ALLOWED_CHAT_ID,
-    _TG_API,
-    _post,
-    cmd_help,
-    cmd_run,
-    cmd_latest,
-    cmd_next,
-    cmd_additions,
-    send,
+    BOT_TOKEN, ALLOWED_CHAT_ID, _TG_API, _post,
+    cmd_help, cmd_run, cmd_latest, cmd_next, cmd_additions, send,
 )
 from agent import SYSTEM_PROMPT, TOOLS, execute_tool  # noqa: E402
 
@@ -90,22 +77,24 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-S3_BUCKET    = "s3bucketmz"
-S3_STATE_KEY = "telegram-polling-offset.json"   # dedicated key; avoids Lambda conflicts
-POLL_TIMEOUT = 30        # seconds for Telegram long-poll
-HEARTBEAT_INTERVAL = 60  # seconds between heartbeat log lines
+S3_BUCKET     = "s3bucketmz"
+S3_STATE_KEY  = "telegram-polling-offset.json"  # dedicated key, no Lambda conflict
+POLL_INTERVAL = 2     # seconds between polls (timeout=0 non-blocking style)
+MAX_MSG_AGE   = 180   # skip messages older than this (seconds) — same as Lambda
+HEARTBEAT_INTERVAL = 60
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
-_shutdown = threading.Event()
+_shutdown = False
 
 def _on_signal(sig, _frame):
-    log.info("Signal %s received — shutting down cleanly.", sig)
-    _shutdown.set()
+    global _shutdown
+    log.info("Signal %s received — shutting down.", sig)
+    _shutdown = True
 
 signal.signal(signal.SIGTERM, _on_signal)
 signal.signal(signal.SIGINT,  _on_signal)
 
-# ── S3 state (update offset) ─────────────────────────────────────────────────
+# ── S3 offset ─────────────────────────────────────────────────────────────────
 _s3_client = None
 
 def _s3():
@@ -120,11 +109,27 @@ def load_offset() -> int:
         obj  = _s3().get_object(Bucket=S3_BUCKET, Key=S3_STATE_KEY)
         data = json.loads(obj["Body"].read())
         offset = int(data.get("next_offset", 0))
-        log.info("Loaded offset %d from S3.", offset)
-        return offset
+        if offset:
+            log.info("Loaded offset %d from S3.", offset)
+            return offset
     except Exception as exc:
-        log.warning("Could not load offset from S3 (%s) — starting from 0.", exc)
-        return 0
+        log.warning("Could not load offset from S3 (%s).", exc)
+    # No saved offset — skip the backlog, start from now (same as Lambda get_fresh_offset)
+    return _get_fresh_offset()
+
+
+def _get_fresh_offset() -> int:
+    """Return offset just past the latest existing update to skip the backlog."""
+    try:
+        result = tg_post("getUpdates", {"limit": 1, "timeout": 0})
+        updates = result.get("result", [])
+        if updates:
+            offset = updates[-1]["update_id"] + 1
+            log.info("Fresh offset from Telegram: %d (skipping backlog).", offset)
+            return offset
+    except Exception as exc:
+        log.warning("Could not fetch fresh offset: %s", exc)
+    return 0
 
 
 def save_offset(offset: int) -> None:
@@ -138,78 +143,45 @@ def save_offset(offset: int) -> None:
     except Exception as exc:
         log.warning("Could not save offset to S3: %s", exc)
 
-# ── Telegram API ──────────────────────────────────────────────────────────────
 
-def _tg_get(method: str, params: dict | None = None, timeout: int = 35) -> dict:
-    url = f"{_TG_API}/{method}"
-    if params:
-        qs  = "&".join(f"{k}={v}" for k, v in params.items())
-        url = f"{url}?{qs}"
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+# ── Telegram helpers ──────────────────────────────────────────────────────────
+
+def tg_post(method: str, payload: dict) -> dict:
+    data = json.dumps(payload).encode()
+    req  = urllib.request.Request(
+        f"{_TG_API}/{method}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read())
 
 
 def get_updates(offset: int) -> list:
     try:
-        resp = _tg_get(
-            "getUpdates",
-            {
-                "offset":           offset,
-                "timeout":          POLL_TIMEOUT,
-                "allowed_updates":  "message",
-            },
-            timeout=POLL_TIMEOUT + 5,
-        )
-        return resp.get("result", [])
-    except urllib.error.URLError as exc:
-        log.warning("getUpdates network error: %s", exc)
-        return []
+        result = tg_post("getUpdates", {
+            "offset":          offset,
+            "limit":           10,
+            "timeout":         0,         # non-blocking, same as Lambda
+            "allowed_updates": ["message"],
+        })
+        return result.get("result", [])
     except Exception as exc:
-        log.error("getUpdates unexpected error: %s", exc)
+        log.warning("getUpdates error: %s", exc)
         return []
+
 
 # ── Claude chat ───────────────────────────────────────────────────────────────
-# Per-chat conversation history (in-memory; reset on process restart)
 _histories: dict[int, list] = {}
-
-_EDIT_INTERVAL = 1.2   # minimum seconds between editMessageText calls
-
-
-def _send_and_get_id(chat_id: int, text: str) -> int | None:
-    """Send a message and return its message_id (for later editing)."""
-    try:
-        resp = _post("sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
-        return resp.get("result", {}).get("message_id")
-    except Exception:
-        return None
-
-
-def _edit(chat_id: int, message_id: int, text: str) -> bool:
-    """Edit an existing message. Returns True on success."""
-    if not message_id:
-        return False
-    try:
-        _post("editMessageText", {
-            "chat_id":    chat_id,
-            "message_id": message_id,
-            "text":       text[:4096],
-        })
-        return True
-    except Exception as exc:
-        if "message is not modified" not in str(exc):
-            log.warning("editMessageText failed: %s", exc)
-        return False
 
 
 def _claude_reply(chat_id: int, user_text: str) -> None:
     """
-    Stream Claude's response live into Telegram by editing the placeholder
-    message as text tokens arrive — mirrors agent._agent_turn() but sends
-    to Telegram instead of stdout.
+    Call Claude with the full SPX tool-set and send the reply to Telegram.
 
-    Uses stream.text_stream so the user sees text immediately instead of
-    waiting for the full response (which can include long thinking phases).
+    Matches the Lambda pattern: plain client.messages.create() (no streaming),
+    send 'thinking…' first, then send the final reply as a new message.
+    Conversation history kept in memory for follow-up questions.
     """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -219,122 +191,103 @@ def _claude_reply(chat_id: int, user_text: str) -> None:
     client  = anthropic.Anthropic(api_key=api_key)
     history = _histories.setdefault(chat_id, [])
     history.append({"role": "user", "content": user_text})
+    messages = list(history)
 
-    messages    = list(history)
+    send(chat_id, "_(thinking…)_")
+
     reply_parts: list[str] = []
 
-    # Send the placeholder and grab its message_id so we can edit it live
-    msg_id = _send_and_get_id(chat_id, "_(thinking…)_")
+    try:
+        while True:
+            response = client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=8192,
+                thinking={"type": "adaptive"},
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
 
-    while True:
-        accumulated = ""
-        last_edit   = 0.0   # force first edit as soon as text arrives
+            for block in response.content:
+                if block.type == "text" and block.text.strip():
+                    reply_parts.append(block.text.strip())
 
-        with client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=8192,
-            thinking={"type": "adaptive"},
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        ) as stream:
-            for token in stream.text_stream:
-                accumulated += token
-                now = time.monotonic()
-                if now - last_edit >= _EDIT_INTERVAL:
-                    prefix = "\n\n".join(reply_parts)
-                    live   = (prefix + "\n\n" + accumulated).strip() + " ▌"
-                    _edit(chat_id, msg_id, live)
-                    last_edit = now
-            response = stream.get_final_message()
+            messages.append({"role": "assistant", "content": response.content})
 
-        if accumulated.strip():
-            reply_parts.append(accumulated.strip())
+            if response.stop_reason == "end_turn":
+                break
+            if response.stop_reason != "tool_use":
+                break
 
-        messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                log.info("Tool call: %s (chat %d)", block.name, chat_id)
+                result = execute_tool(block.name, block.input)
+                tool_results.append({
+                    "type":        "tool_result",
+                    "tool_use_id": block.id,
+                    "content":     result,
+                })
+            messages.append({"role": "user", "content": tool_results})
 
-        if response.stop_reason == "end_turn":
-            break
-        if response.stop_reason != "tool_use":
-            break
+    except Exception as exc:
+        log.error("Claude error (chat %d): %s", chat_id, exc, exc_info=True)
+        send(chat_id, f"❌ Error: {exc}")
+        return
 
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            log.info("Tool call: %s (chat %d)", block.name, chat_id)
-            # Show which tool is running
-            status = "\n\n".join(reply_parts)
-            status = (status + f"\n\n_(running {block.name}…)_").strip()
-            _edit(chat_id, msg_id, status)
-            result = execute_tool(block.name, block.input)
-            tool_results.append({
-                "type":        "tool_result",
-                "tool_use_id": block.id,
-                "content":     result,
-            })
-        messages.append({"role": "user", "content": tool_results})
-
-    # Persist the completed conversation turn
     _histories[chat_id] = messages
 
     full_reply = "\n\n".join(reply_parts) or "_(no response)_"
-    log.info("Reply length: %d chars, reply_parts: %d", len(full_reply), len(reply_parts))
+    log.info("Reply %d chars to chat %d.", len(full_reply), chat_id)
 
-    if len(full_reply) <= 4000:
-        if not _edit(chat_id, msg_id, full_reply):
-            send(chat_id, full_reply)   # fallback if edit failed
-    else:
-        if not _edit(chat_id, msg_id, full_reply[:4000]):
-            send(chat_id, full_reply[:4000])
-        for i in range(4000, len(full_reply), 4000):
-            send(chat_id, full_reply[i : i + 4000])
+    for i in range(0, len(full_reply), 4000):
+        send(chat_id, full_reply[i : i + 4000])
 
 
 # ── Command dispatch ──────────────────────────────────────────────────────────
-_COMMANDS: dict[str, callable] = {
+_COMMANDS = {
     "help":      cmd_help,
     "start":     cmd_help,
     "run":       cmd_run,
     "latest":    cmd_latest,
     "next":      cmd_next,
     "additions": cmd_additions,
-    # /reset clears conversation history for this chat
 }
 
 
-def _handle_reset(chat_id: int) -> None:
-    _histories.pop(chat_id, None)
-    send(chat_id, "Conversation history cleared.")
-
-
 def handle_message(message: dict) -> None:
-    chat_id = message["chat"]["id"]
+    chat_id  = message["chat"]["id"]
+    msg_date = message.get("date", 0)
 
     if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
         log.warning("Ignored message from unauthorised chat_id=%d", chat_id)
+        return
+
+    # Skip stale messages (e.g. queued while bot was down) — same as Lambda
+    age = int(time.time()) - msg_date
+    if age > MAX_MSG_AGE:
+        log.info("Skipping stale message (age=%ds) from chat %d.", age, chat_id)
         return
 
     text = (message.get("text") or "").strip()
     if not text:
         return
 
-    log.info("Message from chat_id=%d: %.80s", chat_id, text)
+    log.info("Message from chat_id=%d (age=%ds): %.80s", chat_id, age, text)
 
     if text.startswith("/"):
         cmd = text.split()[0].lstrip("/").lower().split("@")[0]
         if cmd == "reset":
-            _handle_reset(chat_id)
+            _histories.pop(chat_id, None)
+            send(chat_id, "Conversation history cleared.")
         elif cmd in _COMMANDS:
-            reply = _COMMANDS[cmd]()
-            send(chat_id, reply)
+            send(chat_id, _COMMANDS[cmd]())
         else:
             send(chat_id, f"Unknown command: /{cmd}\nUse /help.")
     else:
-        # Free-form question → Claude in a background thread so polling loop
-        # stays responsive while Claude thinks (can take 30-90 seconds)
-        t = threading.Thread(target=_claude_reply, args=(chat_id, text), daemon=True)
-        t.start()
+        _claude_reply(chat_id, text)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -343,40 +296,36 @@ def run() -> None:
     if not BOT_TOKEN:
         sys.exit("ERROR: TELEGRAM_BOT_TOKEN is not set.")
 
-    log.info("Bot started. Poll timeout=%ds.", POLL_TIMEOUT)
+    log.info("Bot started. Poll interval=%ds, max_msg_age=%ds.", POLL_INTERVAL, MAX_MSG_AGE)
 
     offset            = load_offset()
     last_heartbeat    = time.monotonic()
     updates_processed = 0
 
-    while not _shutdown.is_set():
-
-        # Heartbeat log
+    while not _shutdown:
         now = time.monotonic()
         if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-            log.info("Heartbeat — offset=%d, updates_processed=%d", offset, updates_processed)
+            log.info("Heartbeat — offset=%d, processed=%d.", offset, updates_processed)
             last_heartbeat = now
 
         updates = get_updates(offset)
 
         for update in updates:
             update_id = update["update_id"]
-            msg = update.get("message") or update.get("edited_message")
-            if msg:
-                try:
-                    handle_message(msg)
-                    updates_processed += 1
-                except Exception as exc:
-                    log.error("Error handling update %d: %s", update_id, exc, exc_info=True)
-            offset = update_id + 1
+            offset    = update_id + 1
             save_offset(offset)
 
-        # If long-poll returned nothing, a tiny guard prevents tight-looping
-        # on network errors; on success the 30s poll already provides backpressure.
-        if not updates and _shutdown.wait(timeout=0.5):
-            break
+            msg = update.get("message") or update.get("edited_message")
+            if not msg:
+                continue
+            try:
+                handle_message(msg)
+                updates_processed += 1
+            except Exception as exc:
+                log.error("Error handling update %d: %s", update_id, exc, exc_info=True)
 
-    log.info("Polling stopped. Total updates processed: %d", updates_processed)
+        if not updates:
+            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
