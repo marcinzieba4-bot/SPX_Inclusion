@@ -91,7 +91,7 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 S3_BUCKET    = "s3bucketmz"
-S3_STATE_KEY = "telegram-agent-state.json"
+S3_STATE_KEY = "telegram-polling-offset.json"   # dedicated key; avoids Lambda conflicts
 POLL_TIMEOUT = 30        # seconds for Telegram long-poll
 HEARTBEAT_INTERVAL = 60  # seconds between heartbeat log lines
 
@@ -331,8 +331,10 @@ def handle_message(message: dict) -> None:
         else:
             send(chat_id, f"Unknown command: /{cmd}\nUse /help.")
     else:
-        # Free-form question → Claude (_claude_reply sends the placeholder itself)
-        _claude_reply(chat_id, text)
+        # Free-form question → Claude in a background thread so polling loop
+        # stays responsive while Claude thinks (can take 30-90 seconds)
+        t = threading.Thread(target=_claude_reply, args=(chat_id, text), daemon=True)
+        t.start()
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
