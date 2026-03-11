@@ -185,19 +185,21 @@ def _send_and_get_id(chat_id: int, text: str) -> int | None:
         return None
 
 
-def _edit(chat_id: int, message_id: int, text: str) -> None:
-    """Edit an existing message. Silently ignores 'not modified' errors."""
+def _edit(chat_id: int, message_id: int, text: str) -> bool:
+    """Edit an existing message. Returns True on success."""
     if not message_id:
-        return
+        return False
     try:
         _post("editMessageText", {
             "chat_id":    chat_id,
             "message_id": message_id,
             "text":       text[:4096],
         })
+        return True
     except Exception as exc:
         if "message is not modified" not in str(exc):
-            log.debug("editMessageText failed: %s", exc)
+            log.warning("editMessageText failed: %s", exc)
+        return False
 
 
 def _claude_reply(chat_id: int, user_text: str) -> None:
@@ -277,12 +279,14 @@ def _claude_reply(chat_id: int, user_text: str) -> None:
     _histories[chat_id] = messages
 
     full_reply = "\n\n".join(reply_parts) or "_(no response)_"
+    log.info("Reply length: %d chars, reply_parts: %d", len(full_reply), len(reply_parts))
 
     if len(full_reply) <= 4000:
-        _edit(chat_id, msg_id, full_reply)
+        if not _edit(chat_id, msg_id, full_reply):
+            send(chat_id, full_reply)   # fallback if edit failed
     else:
-        # First chunk replaces the placeholder; subsequent chunks are new messages
-        _edit(chat_id, msg_id, full_reply[:4000])
+        if not _edit(chat_id, msg_id, full_reply[:4000]):
+            send(chat_id, full_reply[:4000])
         for i in range(4000, len(full_reply), 4000):
             send(chat_id, full_reply[i : i + 4000])
 
@@ -327,8 +331,7 @@ def handle_message(message: dict) -> None:
         else:
             send(chat_id, f"Unknown command: /{cmd}\nUse /help.")
     else:
-        # Free-form question → Claude
-        send(chat_id, "_(thinking…)_")
+        # Free-form question → Claude (_claude_reply sends the placeholder itself)
         _claude_reply(chat_id, text)
 
 
