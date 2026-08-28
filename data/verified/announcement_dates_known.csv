@@ -1,0 +1,35 @@
+ticker,announce_date,effective_date,confidence,note
+ETSY,2020-09-04,2020-09-21,high,Sep 2020 quarterly rebalance (TSLA famously passed over)
+TER,2020-09-04,2020-09-21,high,Sep 2020 quarterly rebalance
+CTLT,2020-09-04,2020-09-21,high,Sep 2020 quarterly rebalance
+TSLA,2020-11-16,2020-12-21,high,Special announcement; largest addition ever at the time
+GNRC,2021-03-12,2021-03-22,medium,Mar 2021 quarterly rebalance
+CZR,2021-03-12,2021-03-22,medium,Mar 2021 quarterly rebalance
+PENN,2021-03-12,2021-03-22,medium,Mar 2021 quarterly rebalance
+MRNA,2021-07-15,2021-07-21,high,Off-cycle add
+ON,2022-06-03,2022-06-21,medium,Jun 2022 quarterly rebalance
+KDP,2022-06-03,2022-06-21,medium,Jun 2022 quarterly rebalance
+ABNB,2023-09-01,2023-09-18,high,Sep 2023 quarterly rebalance
+BX,2023-09-01,2023-09-18,high,Sep 2023 quarterly rebalance
+UBER,2023-12-01,2023-12-18,high,Dec 2023 quarterly rebalance
+JBL,2023-12-01,2023-12-18,high,Dec 2023 quarterly rebalance
+BLDR,2023-12-01,2023-12-18,high,Dec 2023 quarterly rebalance
+SMCI,2024-03-01,2024-03-18,high,Mar 2024 quarterly rebalance
+DECK,2024-03-01,2024-03-18,high,Mar 2024 quarterly rebalance
+CRWD,2024-06-07,2024-06-24,high,Jun 2024 quarterly rebalance
+KKR,2024-06-07,2024-06-24,high,Jun 2024 quarterly rebalance
+GDDY,2024-06-07,2024-06-24,high,Jun 2024 quarterly rebalance
+PLTR,2024-09-06,2024-09-23,high,Sep 2024 quarterly rebalance
+DELL,2024-09-06,2024-09-23,high,Sep 2024 quarterly rebalance
+ERIE,2024-09-06,2024-09-23,high,Sep 2024 quarterly rebalance
+APO,2024-12-06,2024-12-23,high,Dec 2024 quarterly rebalance
+WDAY,2024-12-06,2024-12-23,high,Dec 2024 quarterly rebalance
+LII,2024-12-06,2024-12-23,high,Dec 2024 quarterly rebalance
+DASH,2025-03-07,2025-03-24,high,Mar 2025 quarterly rebalance
+TKO,2025-03-07,2025-03-24,high,Mar 2025 quarterly rebalance
+WSM,2025-03-07,2025-03-24,high,Mar 2025 quarterly rebalance
+EXE,2025-03-07,2025-03-24,high,Mar 2025 quarterly rebalance
+COIN,2025-05-12,2025-05-19,high,Off-cycle add (replaced Discover)
+HOOD,2025-09-05,2025-09-22,high,Sep 2025 quarterly rebalance
+APP,2025-09-05,2025-09-22,high,Sep 2025 quarterly rebalance
+EME,2025-09-05,2025-09-22,high,Sep 2025 quarterly rebalance
