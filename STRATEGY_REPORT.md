@@ -113,3 +113,9 @@ For reference, SPY itself did **14.9% CAGR, Sharpe 0.92** over the same period. 
 ---
 
 *Reproduce: `python3 honest_backtest.py` (offline — uses cached prices). Full per-event data in `data/verified/honest_backtest_results.json`.*
+
+---
+
+## Addendum — Announcement-trade PnL simulation (`announcement_arb.py`)
+
+Simulated the implementable trade (entry: first close after the announcement) on all 205 events with an exit sweep and an SPX-hedged version. Headline results: best exit **effective +3 trading days** (eff+0…+3 is one plateau; the edge fully decays by eff+15); avg **+1.13% net per hedged trade** (54% hit, profit factor 1.56); market-neutral book **+25.4% total** at 2.9% vol, max DD −6.8%, positive 10/14 years incl. **+3.5% in 2022** (SPY −18%); as an overlay on SPY it adds **+1.9pp/yr** (16.6% vs 14.7% CAGR, Sharpe 0.99 vs 0.91). Full trade log and curves: `data/verified/announcement_arb_results.json`.
